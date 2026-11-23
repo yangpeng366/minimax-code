@@ -15,6 +15,7 @@ export function createManualCompactionChange(
   previousMessages: CanonicalHistorySnapshot['messages'],
   result: CompletedContextCompaction,
   attemptId: string,
+  expectedParentRevision?: string,
 ): CanonicalHistoryChange & {
   readonly operation: {
     readonly id: string;
@@ -28,6 +29,7 @@ export function createManualCompactionChange(
     messages: cloneCompactionMessages(result.replacementMessages),
     previousMessages: cloneCompactionMessages(previousMessages),
     metadata: createCompactionReplaceMetadata(result, 'manual', attemptId),
+    ...(expectedParentRevision ? { expectedParentRevision } : {}),
     operation: {
       id: `agent-host:${input.lease.turnId}:history:compaction:${encodeURIComponent(result.compactionId)}`,
       kind: 'compaction',

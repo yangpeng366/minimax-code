@@ -19,6 +19,7 @@ import {
 } from '../compaction/context-compaction.js';
 import { AgentHostDependencyUnavailableError } from '../empty-dependencies.js';
 import { SemanticReplayRegistry } from '../events/semantic-replay-registry.js';
+import { isDuplicateIdentityFailure } from '../../../session-system/messages/history/canonical-history-errors.js';
 import { resetPtcPrefixBaseline } from '../runner/policy/ptc-prefix-fingerprint.js';
 import { captureSemanticSnapshot, estimateSemanticValueSize } from './semantic-identity.js';
 
@@ -238,8 +239,46 @@ export class AgentHostCommittedHistoryWriter {
       await this.completeCompaction(context, delivered, metadata, compaction);
       return delivered;
     } catch (error) {
+      const alreadyDurable = await this.resolveAlreadyDurableAppend(plan, error);
+      if (alreadyDurable) return alreadyDurable;
       return this.failCommit({ context, change, error, metadata, compaction });
     }
+  }
+
+  private async resolveAlreadyDurableAppend(
+    plan: CommitSnapshotPlan,
+    error: unknown,
+  ): Promise<CommittedHistoryChange | undefined> {
+    const { context, change, onDurableCommitted } = plan;
+    // Only an append can be retried into "already durable": a compaction is P2
+    // (superseded-attempt semantics) and every other replacement keeps failing.
+    if (change.reason !== 'messageDelta' || !hasDuplicateIdentityFailure(error)) {
+      return undefined;
+    }
+    let settled: CanonicalHistorySnapshot;
+    try {
+      settled = captureSemanticSnapshot(await this.dependencies.history.read(context.sessionId)).value;
+      validateCommittedSnapshot(settled, change.operation.id);
+    } catch {
+      return undefined;
+    }
+    // The append lane only grows the tail, so "already durable" means the
+    // prepared messages are exactly the committed tail. Anything else is a real
+    // identity collision and must keep the failure path.
+    if (!endsWithMessages(settled.messages, change.messages)) return undefined;
+    const delivered = captureSemanticSnapshot<CommittedHistoryChange>({
+      ...change,
+      committedRevision: settled.revision.trim(),
+      committedMessages: settled.messages,
+      ...(settled.identityVector ? { committedIdentityVector: settled.identityVector } : {}),
+    }).value;
+    this.updateUsageAnchor(context, delivered);
+    onDurableCommitted?.(delivered);
+    // The first attempt may have died before the HistoryCommitted projection, so
+    // replay it. Usage observation is skipped: a settled projection may already
+    // have counted these tokens.
+    await this.dependencies.events.handleHistoryCommitted(context, delivered);
+    return delivered;
   }
 
   private async commitTurnMutationSnapshot(
@@ -549,6 +588,21 @@ async function appendCapturedFailure(
 function flattenFailure(error: unknown): readonly unknown[] {
   if (!(error instanceof AggregateError)) return [error];
   return error.errors.flatMap((nested) => flattenFailure(nested));
+}
+
+function hasDuplicateIdentityFailure(error: unknown): boolean {
+  return flattenFailure(error).some((nested) => isDuplicateIdentityFailure(nested));
+}
+
+function endsWithMessages(
+  committed: readonly unknown[],
+  appended: readonly unknown[],
+): boolean {
+  if (appended.length === 0 || appended.length > committed.length) return false;
+  const offset = committed.length - appended.length;
+  return appended.every(
+    (message, index) => JSON.stringify(committed[offset + index]) === JSON.stringify(message),
+  );
 }
 
 function throwFailures(failures: readonly unknown[], message: string): never {

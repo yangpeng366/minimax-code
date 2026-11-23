@@ -605,7 +605,13 @@ export class AgentHostCompactionExecutor<
       );
       if (compaction.status === 'unchanged') return { status: 'unchanged', compaction };
       const completed = requireManualCompletedCompaction(compaction);
-      const change = createManualCompactionChange(input, history.messages, completed, attemptId);
+      const change = createManualCompactionChange(
+        input,
+        history.messages,
+        completed,
+        attemptId,
+        history.revision,
+      );
       validateCanonicalHistoryChange(change, 'replace');
       return { status: 'completed', compaction: completed, change };
     });

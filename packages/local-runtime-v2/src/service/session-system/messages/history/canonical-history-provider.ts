@@ -11,6 +11,10 @@ import {
   type CanonicalHistoryFileAdapter,
 } from '../../sessions/representation/canonical-history-contract.js';
 import { createCanonicalHistoryFileAdapter } from '../../sessions/representation/canonical-history.js';
+import {
+  CanonicalHistoryDuplicateIdentityError,
+  CanonicalHistoryParentRevisionMismatchError,
+} from './canonical-history-errors.js';
 import { repairCanonicalHistory } from './canonical-history-recovery.js';
 import { deleteSessionHistory, type SessionHistoryPaths } from './session-history-paths.js';
 import {
@@ -94,6 +98,11 @@ interface SessionCanonicalHistoryCompactionChangeBase extends Omit<
   readonly currentUserSourceIndex?: number;
   /** Hidden markers placed directly before that tail; absent means 1. */
   readonly placedMarkerCount?: number;
+  /**
+   * Active revision the replacement was prepared against. When supplied, a
+   * different active revision fails closed instead of minting a new generation.
+   */
+  readonly expectedParentRevision?: string;
 }
 
 export type SessionCanonicalHistoryCompactionChange = SessionCanonicalHistoryCompactionChangeBase &
@@ -292,6 +301,14 @@ export function createSessionSystemCanonicalHistoryProvider(
             `g${String(generation).padStart(12, '0')}--${compactionId}.jsonl`,
           );
           const preRevision = canonicalActiveHistoryRevision(active);
+          const expectedParentRevision = change.expectedParentRevision?.trim();
+          if (expectedParentRevision && expectedParentRevision !== preRevision) {
+            throw new CanonicalHistoryParentRevisionMismatchError(
+              change.sessionId,
+              expectedParentRevision,
+              preRevision,
+            );
+          }
           const replacement = compactionReplacementEnvelopes(change, active);
           const marker: NonNullable<CanonicalHistoryEnvelope['history_artifact']> = {
             schemaVersion: 1,
@@ -499,7 +516,7 @@ function assertAppendIdentityBoundary(
   const identities = new Set(existing.map(({ message_id }) => message_id));
   for (const { message_id } of appended) {
     if (identities.has(message_id)) {
-      throw new TypeError(`Canonical history append identity is duplicated: ${message_id}`);
+      throw new CanonicalHistoryDuplicateIdentityError('append', [message_id]);
     }
     identities.add(message_id);
   }
@@ -531,7 +548,7 @@ function replacementEnvelopes(
       index,
     });
     if (used.has(messageId))
-      throw new TypeError(`Canonical history replacement identity is duplicated: ${messageId}`);
+      throw new CanonicalHistoryDuplicateIdentityError('replace', [messageId]);
     used.add(messageId);
     return {
       ...(previous ?? {}),

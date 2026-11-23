@@ -141,6 +141,12 @@ export interface TurnHistoryMutationCommit extends CanonicalHistoryCommit {
 
 export interface CanonicalHistoryCompactionChange extends CanonicalHistoryChange {
   readonly operation: HistoryCommitOperation & { readonly kind: 'compaction' };
+  /**
+   * Active revision this replacement was prepared against. The store fails
+   * closed when a different revision is active, so a re-delivered compaction
+   * cannot mint a second generation for already-durable work.
+   */
+  readonly expectedParentRevision?: string;
 }
 
 export interface CanonicalHistoryStore {

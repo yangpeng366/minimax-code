@@ -115,14 +115,48 @@ P3 below closes this independently of the tombstone.
 
 - **P1 (smallest, still useful):** typed duplicate-identity error + tombstone read/write in
   `AgentHostCommittedHistoryWriter` for `messageDelta` appends. Removes the regex, makes a retried
-  append idempotent, keeps the Session out of `error`.
+  append idempotent, keeps the Session out of `error`. **Landed** — see §6.
 - **P2:** compaction rows in the tombstone + the superseded rule in
-  `AgentHistoryOperationReplayCoordinator.resolve`, so the pipeline and the writer agree.
+  `AgentHistoryOperationReplayCoordinator.resolve`, so the pipeline and the writer agree. Not yet.
 - **P3:** expected-parent guard in the store's `compact` (`change.previousMessages` /
   `metadata.preRevision` vs the active revision), which fails closed on double compaction instead of
-  minting a second generation.
+  minting a second generation. **Landed** as `expectedParentRevision` — see §6.
 
 Each phase is independently revertible; P1 and P3 do not need each other.
+
+## 6. What landed (P1 + P3)
+
+**Typed idempotency signal.** `session-system/messages/history/canonical-history-errors.ts` adds
+`CanonicalHistoryDuplicateIdentityError` (`surface: 'append' | 'replace' | 'user-message-lane'`,
+`messageIds`) and `CanonicalHistoryParentRevisionMismatchError`. Both extend `TypeError` and keep the
+previous message *text* byte-identical, so every existing classifier still matches; only the
+`steering-teardown-commit.ts` regex is replaced by `isDuplicateIdentityFailure` (typed first, text as
+fallback for foreign providers). Throw sites: `assertAppendIdentityBoundary` (append),
+`replacementEnvelopes` (replace), `CanonicalUserMessageIdentityLane.register`.
+
+**P1 read path in the writer.** `AgentHostCommittedHistoryWriter.commitSnapshot` catches a
+duplicate-identity failure on a `messageDelta` change, re-reads settled history, and treats it as
+already durable **only** when the prepared messages are exactly the committed tail
+(`endsWithMessages`). It then returns the settled snapshot as the delivered change and replays
+`handleHistoryCommitted` (the first attempt may have died before the projection). Usage observation
+is deliberately skipped to avoid double token accounting; `historyFailure.fail` is not called, so the
+Session does not flip to `error`. A non-tail collision keeps the original failure path.
+
+**P3 expected-parent guard.** `createManualCompactionChange` now records
+`expectedParentRevision: history.revision` (the revision the compaction was computed from), carried
+through `DurableCanonicalHistoryStore.compact` into the provider. `compact` compares it with
+`canonicalActiveHistoryRevision(active)` **inside the per-session lane, before publishing the
+snapshot**, and throws `CanonicalHistoryParentRevisionMismatchError` on mismatch. A restart-replayed
+compaction therefore fails closed instead of publishing `g(N+1)`.
+
+Tests: `canonical-history-compaction-parent.test.ts` (stale parent rejected with no snapshot; matching
+parent applied once, re-delivery rejected) and `committed-history-writer.test.ts` (duplicate append
+resolves as already durable without `historyFailure.fail`; non-tail duplicate still fails). Both are
+registered in `test/vitest-suites.json` and the source inventory.
+
+Not covered yet (P2): the coordinator still allows a compaction re-commit under the same operation id
+at a different fingerprint, and the writer still reports that as a hard conflict; the superseded rule
+is unchanged.
 
 ## Verification plan
 

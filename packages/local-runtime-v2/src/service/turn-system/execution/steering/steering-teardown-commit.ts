@@ -3,6 +3,7 @@ import type {
   SessionSystemCanonicalHistoryProvider,
 } from '../../../session-system/index.js';
 import { isUserMessageId } from '../../../session-system/index.js';
+import { isDuplicateIdentityFailure } from '../../../session-system/messages/history/canonical-history-errors.js';
 import { prepareSteeringTeardownCanonicalInput } from '../../agent-host/assembly/local-turn-input-preparation.js';
 import type { AgentHostSteeringMessage } from '../../agent-host/contracts.js';
 
@@ -179,5 +180,5 @@ function teardownAppendChange(
 }
 
 function isDuplicateIdentityError(error: unknown): boolean {
-  return error instanceof TypeError && /identity is duplicated/.test(error.message);
+  return isDuplicateIdentityFailure(error);
 }

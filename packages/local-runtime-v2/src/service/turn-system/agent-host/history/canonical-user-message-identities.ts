@@ -1,4 +1,5 @@
 import type { UserMessageId } from '../../../session-system/index.js';
+import { CanonicalHistoryDuplicateIdentityError } from '../../../session-system/messages/history/canonical-history-errors.js';
 import type {
   CanonicalHistoryChange,
   CanonicalHistorySnapshot,
@@ -43,7 +44,7 @@ export class CanonicalUserMessageIdentityLane {
   register(messageIds: readonly UserMessageId[], batchId?: string): void {
     for (const messageId of messageIds) {
       if (this.known.has(messageId)) {
-        throw new TypeError(`Canonical user message identity is duplicated: ${messageId}`);
+        throw new CanonicalHistoryDuplicateIdentityError('user-message-lane', [messageId]);
       }
       this.known.add(messageId);
       this.pending.push({ messageId, ...(batchId ? { batchId } : {}) });
