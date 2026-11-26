@@ -224,6 +224,8 @@ export class AgentHostCommittedHistoryWriter {
   private async commitSnapshot(plan: CommitSnapshotPlan): Promise<CommittedHistoryChange> {
     const { context, change, metadata, compaction, onDurableCommitted } = plan;
     try {
+      const applied = await this.resolveAppliedCompaction(plan);
+      if (applied) return applied;
       const committed = captureSemanticSnapshot(await this.commitCanonical(change)).value;
       validateCommittedSnapshot(committed, change.operation.id);
       const delivered = captureSemanticSnapshot<CommittedHistoryChange>({
@@ -243,6 +245,58 @@ export class AgentHostCommittedHistoryWriter {
       if (alreadyDurable) return alreadyDurable;
       return this.failCommit({ context, change, error, metadata, compaction });
     }
+  }
+
+  /**
+   * Pre-execution tombstone query for compactions.
+   *
+   * The durable tombstone is the committed history itself: a compaction is the
+   * only mutation that both replaces the head with rows derived from the parent
+   * it was computed from and records that parent revision. So a re-delivered
+   * compaction (expected parent no longer active, prepared replacement already at
+   * the head) is answered by one settled read instead of a second generation, a
+   * hard conflict or a fail-closed Session error. Nothing is executed and no
+   * usage is observed; only the required HistoryCommitted projection is replayed.
+   */
+  private async resolveAppliedCompaction(
+    plan: CommitSnapshotPlan,
+  ): Promise<CommittedHistoryChange | undefined> {
+    const { context, change, metadata, compaction, onDurableCommitted } = plan;
+    if (change.operation.kind !== 'compaction' || change.messages.length === 0) return undefined;
+    const expectedParent = asCompactionChange(change).expectedParentRevision?.trim();
+    // Without a recorded parent there is no durable tombstone to query: keep
+    // today's execute-then-fail behaviour.
+    if (!expectedParent) return undefined;
+    let settled: CanonicalHistorySnapshot;
+    try {
+      settled = captureSemanticSnapshot(await this.dependencies.history.read(context.sessionId)).value;
+      validateCommittedSnapshot(settled, change.operation.id);
+    } catch {
+      return undefined;
+    }
+    // The recorded parent is still active, so this attempt has not landed yet.
+    if (settled.revision.trim() === expectedParent) return undefined;
+    // The parent moved for some other reason (another append or compaction): the
+    // prepared replacement only proves this attempt landed when it is the head.
+    if (!startsWithMessages(settled.messages, change.messages)) return undefined;
+    const delivered = captureSemanticSnapshot<CommittedHistoryChange>({
+      ...change,
+      committedRevision: settled.revision.trim(),
+      committedMessages: settled.messages,
+      ...(settled.identityVector ? { committedIdentityVector: settled.identityVector } : {}),
+    }).value;
+    this.updateUsageAnchor(context, delivered);
+    onDurableCommitted?.(delivered);
+    await this.dependencies.events.handleHistoryCommitted(context, delivered);
+    if (metadata && compaction) {
+      try {
+        await this.completeCompaction(context, delivered, metadata, compaction);
+      } catch {
+        // The replacement is durable, so a superseded attempt cannot fail the
+        // Session afterwards; a leftover lifecycle row is the smaller defect.
+      }
+    }
+    return delivered;
   }
 
   private async resolveAlreadyDurableAppend(
@@ -601,8 +655,35 @@ function endsWithMessages(
   if (appended.length === 0 || appended.length > committed.length) return false;
   const offset = committed.length - appended.length;
   return appended.every(
-    (message, index) => JSON.stringify(committed[offset + index]) === JSON.stringify(message),
+    (message, index) => messageFingerprint(committed[offset + index]) === messageFingerprint(message),
   );
+}
+
+function startsWithMessages(
+  committed: readonly unknown[],
+  replacement: readonly unknown[],
+): boolean {
+  if (replacement.length === 0 || replacement.length > committed.length) return false;
+  return replacement.every(
+    (message, index) => messageFingerprint(committed[index]) === messageFingerprint(message),
+  );
+}
+
+/**
+ * The store persists a native compaction summary as `{role, summary}` and drops
+ * the provider-only fields, so the prepared row never matches byte-for-byte.
+ */
+function messageFingerprint(message: unknown): string {
+  if (
+    typeof message === 'object' &&
+    message !== null &&
+    !Array.isArray(message) &&
+    Reflect.get(message, 'role') === 'compactionSummary' &&
+    typeof Reflect.get(message, 'summary') === 'string'
+  ) {
+    return JSON.stringify({ role: 'compactionSummary', summary: Reflect.get(message, 'summary') });
+  }
+  return JSON.stringify(message);
 }
 
 function throwFailures(failures: readonly unknown[], message: string): never {

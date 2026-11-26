@@ -117,7 +117,8 @@ P3 below closes this independently of the tombstone.
   `AgentHostCommittedHistoryWriter` for `messageDelta` appends. Removes the regex, makes a retried
   append idempotent, keeps the Session out of `error`. **Landed** — see §6.
 - **P2:** compaction rows in the tombstone + the superseded rule in
-  `AgentHistoryOperationReplayCoordinator.resolve`, so the pipeline and the writer agree. Not yet.
+  `AgentHistoryOperationReplayCoordinator.resolve`, so the pipeline and the writer agree. **Writer side
+  landed** (pre-execution query, see §6); the coordinator half is still open.
 - **P3:** expected-parent guard in the store's `compact` (`change.previousMessages` /
   `metadata.preRevision` vs the active revision), which fails closed on double compaction instead of
   minting a second generation. **Landed** as `expectedParentRevision` — see §6.
@@ -154,9 +155,23 @@ parent applied once, re-delivery rejected) and `committed-history-writer.test.ts
 resolves as already durable without `historyFailure.fail`; non-tail duplicate still fails). Both are
 registered in `test/vitest-suites.json` and the source inventory.
 
-Not covered yet (P2): the coordinator still allows a compaction re-commit under the same operation id
-at a different fingerprint, and the writer still reports that as a hard conflict; the superseded rule
-is unchanged.
+**P2-lite pre-execution query (writer side of P2).** No sidecar ledger: the durable tombstone is the
+committed history itself, because a compaction is the only mutation that (a) replaces the head with
+rows derived from the parent it was computed from and (b) records that parent in
+`expectedParentRevision`. Before executing a `kind: 'compaction'` change,
+`AgentHostCommittedHistoryWriter.resolveAppliedCompaction` reads the settled snapshot once and answers
+"already applied" only when both hold: the recorded parent is no longer the active revision, and the
+prepared replacement is exactly the head of the settled messages (`startsWithMessages`, with the
+native compaction summary compared as `{role, summary}` because the store drops the provider-only
+fields). On a hit the writer returns the settled snapshot, replays `handleHistoryCommitted`, skips
+mutation and usage observation, and completes the compaction lifecycle best-effort — a superseded
+attempt no longer flips the Session to `error` and no longer mints `g(N+1)`. A moved parent with a
+different head keeps the fail-closed path, and a still-active parent executes normally.
+
+Not covered yet (P2 remainder): the coordinator still allows a compaction re-commit under the same
+operation id at a different fingerprint and the writer's replay registry still reports that as a hard
+conflict. The automatic compaction lane does not record `expectedParentRevision` yet, so its
+double-compaction is only guarded by the generation check.
 
 ## Verification plan
 
@@ -173,9 +188,11 @@ Not executed here (no `node_modules`). When a working tree with `pnpm install` i
 
 ## Open questions
 
-- Tombstone placement: sidecar file in the session history directory versus a column on the history
-  index. A sidecar keeps the JSONL store append-only and survives the snapshot generations; a column
-  keeps read amplification at zero but needs a migration.
+- Tombstone placement: **decided for P1/P2-lite — no sidecar.** Both idempotency cases are answerable
+  from the committed history itself (append: prepared rows are the committed tail; compaction: recorded
+  parent is no longer active and the prepared replacement is the head), so no migration and no extra
+  write are needed. A sidecar or an index column only becomes necessary if an operation id has to be
+  remembered after the rows it produced were compacted away.
 - Retention: operation ids are per Turn (`agent-host:<turnId>:history:*`), so the ledger can be
   truncated with the Turn-retention window; the exact window is not yet decided.
 - `projectHistoryFailure` writes the Session row directly and can therefore relabel a Session whose
